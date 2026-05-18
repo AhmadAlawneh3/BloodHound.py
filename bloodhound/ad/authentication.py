@@ -37,6 +37,10 @@ import ldap3
 from ldap3 import Server, Connection, NTLM, ALL, SASL, KERBEROS, Tls
 from ldap3.core.results import RESULT_STRONGER_AUTH_REQUIRED
 from ldap3.operation.bind import bind_operation
+from ldap3.protocol.rfc4511 import (
+    BindRequest, Version, AuthenticationChoice,
+    SicilyPackageDiscovery, SicilyNegotiate, SicilyResponse,
+)
 from impacket.krb5.ccache import CCache
 from impacket.krb5.types import Principal, KerberosTime, Ticket
 from pyasn1.codec.der import decoder, encoder
@@ -45,9 +49,16 @@ from impacket.krb5.asn1 import AP_REQ, AS_REP, TGS_REQ, Authenticator, TGS_REP, 
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS, sendReceive
 from impacket.krb5.gssapi import CheckSumField, GSSAPI, GSS_C_SEQUENCE_FLAG, GSS_C_REPLAY_FLAG, GSS_C_MUTUAL_FLAG, GSS_C_CONF_FLAG, GSS_C_INTEG_FLAG
+from impacket.ntlm import (
+    SIGN, SEAL, SIGNKEY, SEALKEY,
+    NTLMSSP_NEGOTIATE_SIGN, NTLMSSP_NEGOTIATE_SEAL,
+    getNTLMSSPType1, getNTLMSSPType3,
+)
 import datetime
 from pyasn1.type.univ import noValue
 from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
+from Cryptodome.Cipher import ARC4
+
 
 class GSSAPISocketWrapper:
     def __init__(self, sock, cipher, session_key):
@@ -88,10 +99,72 @@ class GSSAPISocketWrapper:
         return getattr(self._sock, name)
 
 
+class NTLMSocketWrapper:
+    """Wraps an ldap3 socket to apply NTLM session signing/sealing on each LDAP PDU."""
+    def __init__(self, sock, flags, exported_session_key):
+        self._sock = sock
+        self._flags = flags
+        self._sealing = bool(flags & NTLMSSP_NEGOTIATE_SEAL)
+        self._client_signing_key = SIGNKEY(flags, exported_session_key, 'Client')
+        self._server_signing_key = SIGNKEY(flags, exported_session_key, 'Server')
+        self._client_sealing_handle = ARC4.new(SEALKEY(flags, exported_session_key, 'Client')).encrypt
+        self._server_sealing_handle = ARC4.new(SEALKEY(flags, exported_session_key, 'Server')).encrypt
+        self._send_seq = 0
+        self._recv_seq = 0
+        self._recv_buf = b''
+
+    def sendall(self, data):
+        if self._sealing:
+            body, signature = SEAL(self._flags, self._client_signing_key, None,
+                                   data, data, self._send_seq, self._client_sealing_handle)
+        else:
+            signature = SIGN(self._flags, self._client_signing_key, data,
+                             self._send_seq, self._client_sealing_handle)
+            body = data
+        self._send_seq += 1
+        frame = signature.getData() + body
+        self._sock.sendall(struct.pack('!I', len(frame)) + frame)
+
+    def _recv_exact(self, n):
+        out = b''
+        while len(out) < n:
+            chunk = self._sock.recv(n - len(out))
+            if not chunk:
+                return b''
+            out += chunk
+        return out
+
+    def recv(self, size):
+        if self._recv_buf:
+            out, self._recv_buf = self._recv_buf[:size], self._recv_buf[size:]
+            return out
+        hdr = self._recv_exact(4)
+        if len(hdr) < 4:
+            return b''
+        frame_len = struct.unpack('!I', hdr)[0]
+        frame = self._recv_exact(frame_len)
+        if len(frame) < 16:
+            return b''
+        # First 16 bytes are the NTLM message signature; remainder is the LDAP PDU body.
+        body = frame[16:]
+        if self._sealing:
+            plain, _sig = SEAL(self._flags, self._server_signing_key, None,
+                               body, body, self._recv_seq, self._server_sealing_handle)
+        else:
+            plain = body
+        self._recv_seq += 1
+        out, self._recv_buf = plain[:size], plain[size:]
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
 """
 Active Directory authentication helper
 """
 class ADAuthentication(object):
+
     def __init__(self, username='', password='', domain='',
                  lm_hash='', nt_hash='', aeskey='', kdc=None, auth_method='auto', ldap_channel_binding=False):
         self.username = username
@@ -211,6 +284,15 @@ class ADAuthentication(object):
                 self.ldap_channel_binding = True
                 return self.getLDAPConnection(hostname, ip, baseDN, 'ldaps')
             if result['result'] == RESULT_STRONGER_AUTH_REQUIRED and protocol == 'ldap':
+                if self.auth_method in ('auto', 'ntlm'):
+                    logging.warning('LDAP signing is enforced; retrying NTLM with session signing/sealing over plain LDAP')
+                    try:
+                        if self.ldap_ntlm_signing(conn):
+                            return conn
+                        logging.debug('Signed NTLM bind did not succeed; falling back to LDAPS')
+                    except Exception as exc:
+                        logging.debug(traceback.format_exc())
+                        logging.warning('Signed NTLM bind raised %s; falling back to LDAPS', exc)
                 logging.warning('LDAP Authentication is refused because LDAP signing is enabled. '
                                 'Trying to connect over LDAPS instead...')
                 return self.getLDAPConnection(hostname, ip, baseDN, 'ldaps')
@@ -333,6 +415,90 @@ class ADAuthentication(object):
             connection.socket = GSSAPISocketWrapper(connection.socket, cipher, sessionkey)
             connection.refresh_server_info()
         return response['result'] == 0
+
+    def ldap_ntlm_signing(self, connection):
+        """NTLM bind over plain LDAP with session signing/sealing.
+
+        Used when the DC enforces LDAP signing (LdapServerIntegrity=2) but has
+        no usable TLS certificate, so LDAPS is unavailable. Performs a manual
+        sicilyBind via impacket's NTLM stack so we can capture the exported
+        session key + negotiated flags, then wraps the ldap3 socket so every
+        subsequent LDAP PDU is signed (and sealed) per [MS-NLMP].
+        """
+        connection.open(read_server_info=False)
+
+        # Prepare credentials: hash auth uses empty password + hex lm/nt hashes;
+        # password auth uses self.password and empty hashes.
+        if self.nt_hash:
+            password, lmhash, nthash = '', unhexlify(self.lm_hash), unhexlify(self.nt_hash)
+        else:
+            password, lmhash, nthash = self.password, '', ''
+
+        # Step 1: sicilyPackageDiscovery — confirm NTLM is offered by the DC.
+        bind_req = BindRequest()
+        bind_req['version'] = Version(connection.version)
+        bind_req['name'] = ''
+        bind_req['authentication'] = AuthenticationChoice().setComponentByName(
+            'sicilyPackageDiscovery', SicilyPackageDiscovery(''))
+        response = connection.post_send_single_response(
+            connection.send('bindRequest', bind_req, None))[0]
+        if response['result'] != 0:
+            logging.debug('sicilyPackageDiscovery failed: %s', response.get('description'))
+            return False
+        packages = response.get('server_creds', b'') or b''
+        if b'NTLM' not in packages:
+            logging.debug('Server does not advertise NTLM in sicilyPackageDiscovery (got %r)', packages)
+            return False
+
+        # Step 2: sicilyNegotiate — send NTLM Type 1 requesting SIGN+SEAL+KEY_EXCH.
+        negotiate = getNTLMSSPType1('', self.userdomain, signingRequired=True)
+        bind_req = BindRequest()
+        bind_req['version'] = Version(connection.version)
+        bind_req['name'] = 'NTLM'
+        bind_req['authentication'] = AuthenticationChoice().setComponentByName(
+            'sicilyNegotiate', SicilyNegotiate(negotiate.getData()))
+        response = connection.post_send_single_response(
+            connection.send('bindRequest', bind_req, None))[0]
+        if response['result'] != 0:
+            logging.debug('sicilyNegotiate failed: %s', response.get('description'))
+            return False
+        type2 = response.get('server_creds', b'')
+        if not type2:
+            logging.debug('sicilyNegotiate returned no Type 2 challenge')
+            return False
+
+        # Step 3: sicilyResponse — send NTLM Type 3 and capture exported session key.
+        try:
+            type3, exported_session_key = getNTLMSSPType3(
+                negotiate, bytes(type2), self.username, password, self.userdomain,
+                lmhash, nthash)
+        except Exception as exc:
+            logging.debug('getNTLMSSPType3 failed: %s', exc)
+            return False
+
+        bind_req = BindRequest()
+        bind_req['version'] = Version(connection.version)
+        bind_req['name'] = ''
+        bind_req['authentication'] = AuthenticationChoice().setComponentByName(
+            'sicilyResponse', SicilyResponse(type3.getData()))
+        response = connection.post_send_single_response(
+            connection.send('bindRequest', bind_req, None))[0]
+        connection.result = response
+        if response['result'] != 0:
+            logging.debug('sicilyResponse (NTLM Type 3) failed: %s', response.get('description'))
+            return False
+
+        negotiated_flags = type3['flags']
+        # If the DC actually negotiated signing, install the wrapper. Without
+        # SIGN we cannot satisfy LdapServerIntegrity=2, so treat as failure.
+        if not (negotiated_flags & NTLMSSP_NEGOTIATE_SIGN):
+            logging.debug('NTLM bind succeeded but signing was not negotiated (flags=0x%x)', negotiated_flags)
+            return False
+
+        connection.socket = NTLMSocketWrapper(connection.socket, negotiated_flags, exported_session_key)
+        connection.bound = True
+        connection.refresh_server_info()
+        return True
 
     def get_tgt(self):
         """
